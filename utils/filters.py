@@ -1,10 +1,9 @@
-import re
-import unicodedata
-from typing import Optional
+﻿import re
+from typing import List, Optional
 
-from .models import Ad
+from .normalization import normalize_for_matching, normalize_text, normalize_keyword
 
-SEARCH_KEYWORDS = [
+BASE_KEYWORDS: List[str] = [
     "navara",
     "l200",
     "triton",
@@ -13,78 +12,75 @@ SEARCH_KEYWORDS = [
     "raptor",
     "wildtrack",
     "bt-50",
+    "bt50",
     "b2500",
     "pickup",
     "landcruiser",
+    "land cruiser",
     "patrol",
     "gladiator",
     "ram",
 ]
 
-KEYWORD_PATTERNS = [
-    r"navara",
-    r"l[-_ ]*200",
-    r"triton",
-    r"hilux",
-    r"ranger",
-    r"raptor",
-    r"wildtrack",
-    r"bt[-_ ]*50",
-    r"b2500",
-    r"pickup",
-    r"landcruiser",
-    r"patrol",
-    r"gladiator",
-    r"ram",
+EXTENDED_KEYWORDS: List[str] = [
+    "4x4",
+    "tout terrain",
+    "offroad",
+    "utilitaire 4x4",
+    "double cabine",
+    "pick up",
+    "pick-up",
+    "camionnette 4x4",
+    "benne",
+    "plateau",
+    "nissan pickup",
+    "toyota pickup",
+    "mitsubishi pickup",
+    "ford pickup",
+    "mazda pickup",
+    "dodge ram",
+    "jeep pickup",
+    "suv 4x4",
 ]
 
-KEYWORD_REGEX = re.compile(r"\b(?:" + r"|".join(KEYWORD_PATTERNS) + r")\b", re.IGNORECASE)
-
-PRICE_CLEANER = re.compile(r"[^0-9,\.\s]")
-NUMBER_EXTRACTOR = re.compile(r"[0-9]+(?:[.,\s][0-9]{3})*")
-
-
-def normalize_text(text: str) -> str:
-    cleaned = unicodedata.normalize("NFKD", text or "")
-    cleaned = "".join(ch for ch in cleaned if not unicodedata.combining(ch))
-    return cleaned.lower()
+SEARCH_KEYWORDS = BASE_KEYWORDS + EXTENDED_KEYWORDS
+SEARCH_KEYWORDS_NORMALIZED = [normalize_keyword(word) for word in SEARCH_KEYWORDS]
 
 
 def parse_integer(raw: str) -> Optional[int]:
     if not raw:
         return None
 
-    safe = PRICE_CLEANER.sub("", raw)
-    match = NUMBER_EXTRACTOR.search(safe)
-    if not match:
+    cleaned = re.sub(r"[\u00A0\s\.,]+", "", raw)
+    if not cleaned.isdigit():
         return None
 
-    digits = match.group(0).replace(" ", "").replace(".", "").replace(",", "")
-    return int(digits) if digits.isdigit() else None
+    return int(cleaned)
 
 
 def contains_keyword(text: str) -> bool:
+    normalized = normalize_for_matching(text)
+    return any(keyword in normalized for keyword in SEARCH_KEYWORDS_NORMALIZED)
+
+
+def contains_hs(text: str) -> bool:
     normalized = normalize_text(text)
-    normalized = re.sub(r"[\W_]+", " ", normalized)
-    return bool(KEYWORD_REGEX.search(normalized))
+    return bool(re.search(r"\bhs\b", normalized))
 
 
-def is_valid_ad(ad: Ad) -> bool:
-    if ad.price is None or ad.mileage is None:
+def is_valid_ad(title: str, description: str, price: Optional[int], mileage: Optional[int]) -> bool:
+    if price is None or mileage is None:
+        return False
+    if price >= 10000:
+        return False
+    if mileage >= 250000:
         return False
 
-    combined_text = f"{ad.title}\n{ad.description}"
-    if not contains_keyword(combined_text):
+    combined = f"{title} {description}"
+    if contains_hs(combined):
         return False
 
-    if ad.price >= 10000:
-        return False
-
-    if ad.mileage >= 250000:
-        return False
-
-    normalized_desc = normalize_text(ad.description)
-    if re.search(r"\bhs\b", normalized_desc):
+    if not contains_keyword(combined):
         return False
 
     return True

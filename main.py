@@ -1,4 +1,4 @@
-import logging
+﻿import logging
 import os
 import random
 import time
@@ -8,20 +8,18 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from scraper.autoscout import scrape_autoscout
-from scraper.leboncoin import scrape_leboncoin
-from scraper.mobilede import scrape_mobilede
+from scraper import scrape_autoscout, scrape_mobilede, scrape_leboncoin
 from utils.database import Database
 from utils.filters import is_valid_ad
-from utils.notifier import TelegramNotifier
-from utils.pricing import score_ad
 from utils.models import Ad
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 DEFAULT_SLEEP_SECONDS = 7200
 SLEEP_VARIANCE_SECONDS = 600
-MIN_SCRAPER_DELAY_SECONDS = 12
-MAX_SCRAPER_DELAY_SECONDS = 20
+MIN_REQUEST_DELAY_SECONDS = 5
+MAX_REQUEST_DELAY_SECONDS = 15
+MIN_KEYWORD_DELAY_SECONDS = 30
+MAX_KEYWORD_DELAY_SECONDS = 90
 
 
 def configure_logging() -> None:
@@ -39,7 +37,7 @@ def create_session() -> requests.Session:
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/123.0.0.0 Safari/537.36"
+                "Chrome/124.0.0.0 Safari/537.36"
             ),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
@@ -60,113 +58,70 @@ def create_session() -> requests.Session:
     return session
 
 
-def escape_html(text: str) -> str:
-    return (
-        text.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace("\"", "&quot;")
-        .replace("'", "&#39;")
-    )
+def print_ad(ad: Ad) -> None:
+    print("Title:", ad.title)
+    print("Price:", f"{ad.price:,} €")
+    print("Mileage:", f"{ad.mileage:,} km")
+    print("Link:", ad.link)
+    print("Source:", ad.source)
+    print("-")
 
 
-def format_message(ad: Ad) -> str:
-    title = escape_html(ad.title)
-    link = escape_html(ad.link)
-    price = f"{ad.price:,}" if ad.price is not None else "n/a"
-    mileage = f"{ad.mileage:,}" if ad.mileage is not None else "n/a"
-    label = ad.label or "OK"
-    return (
-        f"🚗 {label}\n\n"
-        f"{title}\n\n"
-        f"💰 {price} €\n"
-        f"📏 {mileage} km\n\n"
-        f"🔗 {link}"
-    )
-
-
-def _log_filter_reason(ad: Ad) -> None:
-    if ad.price is None:
-        logging.debug("Filtered out ad %s because price is missing: %s", ad.ad_id, ad.link)
-        return
-    if ad.mileage is None:
-        logging.debug("Filtered out ad %s because mileage is missing: %s", ad.ad_id, ad.link)
-        return
-    if not is_valid_ad(ad):
-        logging.debug(
-            "Filtered out ad %s because it does not meet rules (price=%s, mileage=%s): %s",
-            ad.ad_id,
-            ad.price,
-            ad.mileage,
-            ad.link,
-        )
-        return
-
-
-def run_cycle(session: requests.Session, db: Database, notifier: TelegramNotifier) -> None:
-    logging.info("Starting scrape cycle")
-
-    all_ads: List[Ad] = []
-    scrapers = [
+def run_cycle(session: requests.Session, db: Database) -> None:
+    logging.info("Starting full scan cycle")
+    scraper_functions = [
         ("AutoScout24", scrape_autoscout),
         ("Mobile.de", scrape_mobilede),
         ("Leboncoin", scrape_leboncoin),
     ]
+    all_ads: List[Ad] = []
 
-    for source_name, scraper in scrapers:
+    for source_name, scraper_func in scraper_functions:
         try:
-            logging.info("Scraping %s", source_name)
-            ads = scraper(session)
-            logging.info("Found %d ads on %s", len(ads), source_name)
-            all_ads.extend(ads)
-            time.sleep(random.uniform(MIN_SCRAPER_DELAY_SECONDS, MAX_SCRAPER_DELAY_SECONDS))
+            site_ads = scraper_func(session)
+            logging.info("Collected %d ads from %s", len(site_ads), source_name)
+            all_ads.extend(site_ads)
         except Exception as exc:
-            logging.exception("Failed to scrape %s: %s", source_name, exc)
+            logging.exception("Scraper %s failed: %s", source_name, exc)
+        time.sleep(random.uniform(MIN_REQUEST_DELAY_SECONDS, MAX_REQUEST_DELAY_SECONDS))
 
-    logging.info("Total ads collected: %d", len(all_ads))
+    logging.info("Total ads collected before duplicate filter: %d", len(all_ads))
+    processed_ids: set[str] = set()
 
     for ad in all_ads:
-        if not is_valid_ad(ad) or ad.price is None or ad.mileage is None:
-            _log_filter_reason(ad)
+        if ad.ad_id in processed_ids:
             continue
 
-        ad.market_price, ad.score, ad.label = score_ad(ad.price, ad.mileage)
+        processed_ids.add(ad.ad_id)
+
+        if not is_valid_ad(ad.title, ad.description, ad.price, ad.mileage):
+            logging.debug("Filtered out ad %s from %s", ad.ad_id, ad.source)
+            continue
+
         storage_id = f"{ad.source}:{ad.ad_id}"
-
         if db.has_seen(storage_id):
-            logging.debug("Already notified ad %s", storage_id)
+            logging.debug("Already processed ad %s", storage_id)
             continue
 
-        message = format_message(ad)
-        if notifier.send_message(message):
-            db.mark_seen(ad, storage_id)
-            logging.info("Notified %s: %s", storage_id, ad.label)
-        else:
-            logging.warning("Skipping DB save because notification failed for %s", storage_id)
+        print_ad(ad)
+        db.mark_seen(ad, storage_id)
+
+    logging.info("Scan cycle complete")
 
 
 def main() -> None:
     configure_logging()
-
-    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
-    if not bot_token or not chat_id:
-        logging.error(
-            "Environment variables TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set"
-        )
-        return
-
-    db = Database("car_alerts.db")
-    notifier = TelegramNotifier(bot_token, chat_id)
+    db = Database("seen_ads.db")
     session = create_session()
 
     while True:
         try:
-            run_cycle(session, db, notifier)
+            run_cycle(session, db)
         except Exception:
-            logging.exception("Unexpected error in the main loop")
+            logging.exception("Unexpected error during scan cycle")
+
         delay = DEFAULT_SLEEP_SECONDS + random.uniform(-SLEEP_VARIANCE_SECONDS, SLEEP_VARIANCE_SECONDS)
-        logging.info("Sleeping for %.0f seconds before the next cycle", delay)
+        logging.info("Sleeping for %.0f seconds before next loop", delay)
         time.sleep(delay)
 
 
