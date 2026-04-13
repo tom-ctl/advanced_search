@@ -46,7 +46,16 @@ pip install -r requirements.txt
    - Ajoutez le bot au chat ou envoyez-lui un message.
    - Utilisez une API de test comme `https://api.telegram.org/bot<token>/getUpdates` ou un bot tiers ID finder.
 
-4. Configurez les variables d'environnement :
+4. Créez un fichier `.env` à la racine du projet :
+
+```env
+TELEGRAM_BOT_TOKEN=votre_token
+TELEGRAM_CHAT_ID=votre_chat_id
+```
+
+Vous pouvez partir de `.env.example`.
+
+5. Alternative possible : configurez les variables d'environnement dans votre shell :
 
 ```powershell
 $env:TELEGRAM_BOT_TOKEN = "votre_token"

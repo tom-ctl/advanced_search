@@ -1,5 +1,6 @@
 import logging
 import os
+import random
 import time
 from typing import Any, List, Optional
 from urllib.parse import quote_plus
@@ -17,11 +18,20 @@ SEARCH_URL_TEMPLATE = (
 )
 MAX_PAGES = 5
 PAGE_SIZE = 50
+MIN_BROWSER_PRELOAD_DELAY_SECONDS = 2
+MAX_BROWSER_PRELOAD_DELAY_SECONDS = 5
+LEBONCOIN_REQUEST_INTERVAL_SECONDS = 30
+BROWSER_LOAD_RETRIES = 3
+REALISTIC_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 
 
 def _api_headers() -> dict[str, str]:
     return {
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": REALISTIC_USER_AGENT,
         "Content-Type": "application/json",
         "Accept": "application/json",
         "Origin": "https://www.leboncoin.fr",
@@ -184,59 +194,109 @@ def _is_datadome_blocked(response: Response) -> bool:
     return "captcha-delivery.com" in response.text or "datadome" in response.text.lower()
 
 
-def _load_browser_page(url: str) -> Optional[str]:
-    try:
-        from selenium import webdriver
-        from selenium.webdriver.chrome.options import Options
-    except ImportError:
-        logging.exception("Selenium is not installed; cannot run Leboncoin browser fallback")
-        return None
+def _throttle_request() -> None:
+    logging.info("Leboncoin throttle sleep for %s seconds", LEBONCOIN_REQUEST_INTERVAL_SECONDS)
+    time.sleep(LEBONCOIN_REQUEST_INTERVAL_SECONDS)
+
+
+def _create_webdriver():
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
 
     chrome_path = os.getenv("LEBONCOIN_CHROME_BINARY", r"C:\Program Files\Google\Chrome\Application\chrome.exe")
     edge_path = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
     binary_location = chrome_path if os.path.exists(chrome_path) else edge_path if os.path.exists(edge_path) else None
     if not binary_location:
-        logging.error("No Chrome/Edge binary found for Leboncoin browser fallback")
-        return None
+        raise FileNotFoundError("No Chrome/Edge binary found for Leboncoin browser fallback")
 
-    wait_seconds = int(os.getenv("LEBONCOIN_BROWSER_WAIT_SECONDS", "10"))
     headless = os.getenv("LEBONCOIN_BROWSER_HEADLESS", "0") == "1"
-
     options = Options()
     options.binary_location = binary_location
+    options.add_argument(f"--user-agent={REALISTIC_USER_AGENT}")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1400,1000")
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
     if headless:
         options.add_argument("--headless=new")
 
-    logging.warning(
-        "Leboncoin browser fallback starting url=%s binary=%s headless=%s",
-        url,
-        binary_location,
-        headless,
+    driver = webdriver.Chrome(options=options)
+    driver.execute_script(
+        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
     )
+    return driver, binary_location, headless
 
-    driver = None
+
+def _load_browser_page(url: str) -> Optional[str]:
     try:
-        driver = webdriver.Chrome(options=options)
-        driver.get(url)
-        time.sleep(wait_seconds)
-        html = driver.page_source
-        logging.info("Leboncoin browser fallback loaded %s characters", len(html))
-        return html
-    except Exception as exc:
-        logging.exception("Leboncoin browser fallback failed for %s: %s", url, exc)
+        from selenium.common.exceptions import WebDriverException
+    except ImportError:
+        logging.exception("Selenium is not installed; cannot run Leboncoin browser fallback")
         return None
-    finally:
-        if driver is not None:
-            driver.quit()
+
+    wait_seconds = int(os.getenv("LEBONCOIN_BROWSER_WAIT_SECONDS", "10"))
+
+    for attempt in range(1, BROWSER_LOAD_RETRIES + 1):
+        driver = None
+        try:
+            driver, binary_location, headless = _create_webdriver()
+            preload_delay = random.uniform(
+                MIN_BROWSER_PRELOAD_DELAY_SECONDS,
+                MAX_BROWSER_PRELOAD_DELAY_SECONDS,
+            )
+            logging.warning(
+                "Leboncoin browser load attempt=%s url=%s binary=%s headless=%s preload_delay=%.2fs",
+                attempt,
+                url,
+                binary_location,
+                headless,
+                preload_delay,
+            )
+            time.sleep(preload_delay)
+            driver.get(url)
+            time.sleep(wait_seconds)
+            html = driver.page_source
+            if not html:
+                logging.warning("Leboncoin browser returned empty HTML attempt=%s url=%s", attempt, url)
+                return None
+            logging.info("Leboncoin browser fallback loaded %s characters", len(html))
+            return html
+        except WebDriverException as exc:
+            error_text = str(exc)
+            if "ERR_CONNECTION_CLOSED" in error_text or "net::ERR_CONNECTION_CLOSED" in error_text:
+                logging.warning(
+                    "Leboncoin browser connection closed attempt=%s/%s url=%s: %s",
+                    attempt,
+                    BROWSER_LOAD_RETRIES,
+                    url,
+                    exc,
+                )
+                if attempt < BROWSER_LOAD_RETRIES:
+                    time.sleep(3 * attempt)
+                    continue
+            logging.warning("Leboncoin browser fallback failed attempt=%s url=%s: %s", attempt, url, exc)
+            return None
+        except Exception as exc:
+            logging.warning("Leboncoin browser fallback unexpected failure attempt=%s url=%s: %s", attempt, url, exc)
+            return None
+        finally:
+            if driver is not None:
+                try:
+                    driver.quit()
+                except Exception:
+                    logging.debug("Leboncoin browser quit failed for url=%s", url)
+
+    logging.warning("Leboncoin browser fallback exhausted retries for %s", url)
+    return None
 
 
 def _scrape_browser_fallback(keyword: str, page: int) -> List[Ad]:
     url = _build_search_url(keyword, page)
     html = _load_browser_page(url)
     if not html:
+        logging.warning("Leboncoin browser fallback returned no HTML keyword=%s page=%s", keyword, page)
         return []
 
     ads = _parse_browser_results(html)
@@ -248,33 +308,34 @@ def _scrape_browser_fallback(keyword: str, page: int) -> List[Ad]:
 def scrape_leboncoin(session: Session) -> List[Ad]:
     results: List[Ad] = []
     seen_ids: set[str] = set()
-    browser_fallback_enabled = True
+    skip_api = os.getenv("LEBONCOIN_SKIP_API", "1") == "1"
 
     for keyword in SEARCH_KEYWORDS:
         for page in range(1, MAX_PAGES + 1):
-            offset = (page - 1) * PAGE_SIZE
-            payload = _payload(keyword, offset)
-            logging.info("Leboncoin API request keyword=%s page=%s offset=%s", keyword, page, offset)
+            parsed_ads: List[Optional[Ad]] = []
 
-            try:
-                response = session.post(API_URL, json=payload, headers=_api_headers(), timeout=30)
-                if _is_datadome_blocked(response):
-                    raise PermissionError("DataDome blocked Leboncoin API request")
-                response.raise_for_status()
-                data = response.json()
-                ads_data = data.get("ads") or data.get("ad_list") or []
-                print(f"[LBC] {keyword} page {page} -> {len(ads_data)} ads")
-                parsed_ads = [_parse_api_ad(ad_data) for ad_data in ads_data]
-            except PermissionError as exc:
-                logging.warning("Leboncoin API blocked keyword=%s page=%s: %s", keyword, page, exc)
-                if not browser_fallback_enabled:
-                    break
+            if not skip_api:
+                offset = (page - 1) * PAGE_SIZE
+                payload = _payload(keyword, offset)
+                logging.info("Leboncoin API request keyword=%s page=%s offset=%s", keyword, page, offset)
+                try:
+                    response = session.post(API_URL, json=payload, headers=_api_headers(), timeout=30)
+                    if _is_datadome_blocked(response):
+                        skip_api = True
+                        raise PermissionError("DataDome blocked Leboncoin API request")
+                    response.raise_for_status()
+                    data = response.json()
+                    ads_data = data.get("ads") or data.get("ad_list") or []
+                    print(f"[LBC] {keyword} page {page} -> {len(ads_data)} ads")
+                    parsed_ads = [_parse_api_ad(ad_data) for ad_data in ads_data]
+                except PermissionError as exc:
+                    logging.warning("Leboncoin API blocked keyword=%s page=%s: %s", keyword, page, exc)
+                except Exception as exc:
+                    logging.warning("Leboncoin API failed keyword=%s page=%s: %s", keyword, page, exc)
+
+            if skip_api or not parsed_ads:
+                logging.info("Leboncoin switching to browser mode keyword=%s page=%s", keyword, page)
                 parsed_ads = _scrape_browser_fallback(keyword, page)
-                if not parsed_ads:
-                    break
-            except Exception as exc:
-                logging.exception("Leboncoin API request failed keyword=%s page=%s: %s", keyword, page, exc)
-                break
 
             page_added = 0
             for ad in parsed_ads:
@@ -296,7 +357,10 @@ def scrape_leboncoin(session: Session) -> List[Ad]:
                 len(results),
             )
 
+            _throttle_request()
+
             if not parsed_ads:
+                logging.warning("Leboncoin returned 0 ads keyword=%s page=%s", keyword, page)
                 break
 
     return results

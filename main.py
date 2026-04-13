@@ -2,9 +2,11 @@ import logging
 import os
 import random
 import time
+from pathlib import Path
 from typing import List, Optional
 
 import requests
+from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -20,6 +22,12 @@ DEFAULT_SLEEP_SECONDS = 7200
 SLEEP_VARIANCE_SECONDS = 600
 MIN_REQUEST_DELAY_SECONDS = 2
 MAX_REQUEST_DELAY_SECONDS = 5
+
+
+def load_project_env() -> None:
+    env_path = Path(__file__).resolve().parent / ".env"
+    load_dotenv(dotenv_path=env_path, override=False)
+    logging.debug("Environment loaded from %s", env_path)
 
 
 def configure_logging() -> None:
@@ -62,7 +70,7 @@ def create_notifier() -> Optional[TelegramNotifier]:
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not bot_token or not chat_id:
-        logging.info("Telegram notifier disabled because TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing")
+        logging.warning("Telegram notifier disabled because TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing")
         return None
 
     logging.info("Telegram notifier enabled")
@@ -154,16 +162,21 @@ def run_cycle(session: requests.Session, db: Database, notifier: Optional[Telegr
         print_ad(ad)
         if DEBUG:
             print(f"[NOTIFY - {reason}] {storage_id} | current_price={ad.price}")
+        sent = False
         if notifier is not None:
             sent = notifier.send_message(format_telegram_message(ad))
             logging.info("Telegram send status for %s: %s", storage_id, sent)
-        db.upsert_ad(ad, storage_id, notified=True)
+        else:
+            logging.warning("Telegram notifier unavailable, ad not sent for %s", storage_id)
+
+        db.upsert_ad(ad, storage_id, notified=sent)
 
     logging.info("Scan cycle complete")
 
 
 def main() -> None:
     configure_logging()
+    load_project_env()
     db = Database("car_alerts.db")
     session = create_session()
     notifier = create_notifier()
