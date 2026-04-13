@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.sqlite3
+*.db
+*.db-journal
+.env
+.venv/
+venv/
+
+# VS Code
+.vscode/
+
+# Logs
+*.log
