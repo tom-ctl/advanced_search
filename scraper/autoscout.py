@@ -1,21 +1,30 @@
+import json
 import logging
-import random
 import re
-import time
-from typing import List, Optional
+from typing import Any, Iterable, List, Optional
 
 from bs4 import BeautifulSoup
 from requests import Session
 
-from urllib.parse import quote_plus
-
-from utils.filters import parse_integer, normalize_text, SEARCH_KEYWORDS
+from utils.filters import MAX_MILEAGE, MAX_PRICE, parse_mileage, parse_number, parse_price
 from utils.models import Ad
 
-SEARCH_URL_TEMPLATE = (
-    "https://www.autoscout24.com/lst?sort=standard&desc=0&offer=used&price_to=10000"
-    "&kmto=250000&cy=FR&atype=C&q={keyword}"
-)
+BASE_URL = "https://www.autoscout24.fr"
+MAX_PAGES = 5
+SEARCHES = [
+    ("toyota", "hilux"),
+    ("mitsubishi", "l200"),
+    ("nissan", "navara"),
+    ("ford", "ranger"),
+    ("mazda", "bt-50"),
+]
+
+
+def build_url(make: str, model: str, page: int) -> str:
+    return (
+        f"{BASE_URL}/lst/{make}/{model}"
+        f"?priceTo={MAX_PRICE}&kmto={MAX_MILEAGE}&page={page}"
+    )
 
 
 def _browser_headers() -> dict[str, str]:
@@ -25,94 +34,191 @@ def _browser_headers() -> dict[str, str]:
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/124.0.0.0 Safari/537.36"
         ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Referer": "https://www.autoscout24.com/",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+        "Referer": BASE_URL + "/",
     }
 
 
-def _fetch_page(session: Session, url: str) -> str:
-    session.get("https://www.autoscout24.com", timeout=20, headers=_browser_headers())
-    response = session.get(url, timeout=20, headers=_browser_headers())
-    response.raise_for_status()
-    time.sleep(random.uniform(6.0, 10.0))
-    return response.text
+def _extract_text(node: Optional[BeautifulSoup]) -> str:
+    return node.get_text(" ", strip=True) if node else ""
 
 
-def _extract_text(element: Optional[BeautifulSoup]) -> str:
-    return element.get_text(" ", strip=True) if element else ""
-
-
-def _find_price(node: BeautifulSoup) -> Optional[int]:
-    selectors = ["span[data-item-name='price']", "div[data-item-name='price']"]
-    for selector in selectors:
-        tag = node.select_one(selector)
-        if tag:
-            value = _extract_text(tag)
-            price = parse_integer(value)
-            if price is not None:
-                return price
-
-    text = " ".join(node.stripped_strings)
-    match = re.search(r"(\d[\d\s,.]*)(?:€|eur)", text, re.IGNORECASE)
-    return parse_integer(match.group(1)) if match else None
-
-
-def _find_mileage(node: BeautifulSoup) -> Optional[int]:
-    text = " ".join(node.stripped_strings)
-    match = re.search(r"(\d[\d\s,.]*)\s*(?:km|kilom[eè]tres?)", text, re.IGNORECASE)
-    return parse_integer(match.group(1)) if match else None
+def _absolute_link(link: str) -> str:
+    if link.startswith("/"):
+        return BASE_URL + link
+    return link
 
 
 def _extract_id(link: str) -> str:
-    match = re.search(r"/(\d+)", link)
+    match = re.search(r"/(\d+)(?:[/?#]|$)", link)
     if match:
         return match.group(1)
     return link
 
 
-def scrape_autoscout(session: Session) -> List[Ad]:
-    results: List[Ad] = []
-    seen_ids: set[str] = set()
+def _fetch_page(session: Session, url: str) -> str:
+    response = session.get(url, headers=_browser_headers(), timeout=30)
+    response.raise_for_status()
+    return response.text
 
-    for keyword in SEARCH_KEYWORDS:
-        search_url = SEARCH_URL_TEMPLATE.format(keyword=quote_plus(keyword))
-        logging.info("Loading AutoScout24 search page for '%s'", keyword)
-        try:
-            html = _fetch_page(session, search_url)
-        except Exception as exc:
-            logging.warning("AutoScout24 request failed for '%s': %s", keyword, exc)
+
+def _extract_price(item: BeautifulSoup, text_blob: str) -> Optional[int]:
+    selector_candidates = [
+        "[data-testid='price']",
+        "[aria-label*='prix']",
+        "[aria-label*='price']",
+    ]
+    for selector in selector_candidates:
+        value = _extract_text(item.select_one(selector))
+        if value:
+            price = parse_price(value)
+            if price is not None:
+                return price
+
+    for text in item.stripped_strings:
+        if "€" not in text and "eur" not in text.lower():
+            continue
+        price = parse_price(text)
+        if price is not None:
+            return price
+
+    euro_match = re.search(r"(\d[\d\s.]*)\s*(?:€|eur)", text_blob, re.IGNORECASE)
+    if euro_match:
+        return parse_price(euro_match.group(1))
+
+    return None
+
+
+def _extract_article_ads(items: Iterable[BeautifulSoup]) -> List[Ad]:
+    parsed_ads: List[Ad] = []
+
+    for item in items:
+        link_tag = (
+            item.select_one("a[href*='/offres/']")
+            or item.select_one("a[href*='/lst/']")
+            or item.find("a", href=True)
+        )
+        if not link_tag or not link_tag.get("href"):
             continue
 
-        soup = BeautifulSoup(html, "html.parser")
-        items = soup.find_all("article") or soup.select("div[data-item-name='listing']")
+        link = _absolute_link(link_tag["href"])
+        title = (
+            _extract_text(item.select_one("h2"))
+            or _extract_text(item.select_one("h3"))
+            or _extract_text(item.select_one("[data-testid='title']"))
+            or _extract_text(link_tag)
+        )
+        if not title:
+            continue
 
-        for item in items:
-            link_tag = item.find("a", href=True)
-            if not link_tag:
+        text_blob = " ".join(item.stripped_strings)
+        price = _extract_price(item, text_blob)
+        mileage = parse_mileage(text_blob)
+        ad_id = item.get("id") or item.get("data-guid") or _extract_id(link)
+
+        parsed_ads.append(
+            Ad(
+                source="AutoScout24",
+                ad_id=str(ad_id),
+                title=title,
+                price=price,
+                mileage=mileage,
+                description=text_blob,
+                link=link,
+            )
+        )
+
+    return parsed_ads
+
+
+def _walk(value: Any) -> Iterable[Any]:
+    if isinstance(value, dict):
+        yield value
+        for nested in value.values():
+            yield from _walk(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from _walk(nested)
+
+
+def _extract_json_ads(html: str) -> List[Ad]:
+    soup = BeautifulSoup(html, "html.parser")
+    parsed_ads: List[Ad] = []
+
+    for script in soup.select("script[type='application/ld+json'], script#__NEXT_DATA__"):
+        raw = script.string or script.get_text(strip=True)
+        if not raw:
+            continue
+
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+
+        for node in _walk(payload):
+            if not isinstance(node, dict):
                 continue
-            link = link_tag["href"]
-            if link.startswith("/"):
-                link = "https://www.autoscout24.com" + link
 
-            title = _extract_text(item.select_one("h2")) or _extract_text(link_tag)
-            price = _find_price(item)
-            mileage = _find_mileage(item)
-            description = _extract_text(item.select_one("p"))
-            if not description:
-                description = normalize_text(_extract_text(item))
-
-            ad_id = _extract_id(link)
-            if not title or not ad_id:
+            url = node.get("url") or node.get("offerUrl") or node.get("detailPageUrl") or ""
+            vehicle = node.get("vehicle") if isinstance(node.get("vehicle"), dict) else {}
+            title = (
+                node.get("name")
+                or node.get("title")
+                or node.get("headline")
+                or vehicle.get("modelVersionInput")
+                or vehicle.get("model")
+                or ""
+            )
+            if not url or "/offres/" not in str(url):
                 continue
 
-            if ad_id in seen_ids:
-                continue
+            mileage = None
+            raw_mileage = (
+                node.get("mileageFromOdometer")
+                or node.get("mileage")
+                or node.get("distance")
+                or node.get("km")
+                or vehicle.get("mileageInKm")
+            )
+            if isinstance(raw_mileage, dict):
+                mileage = parse_number(
+                    str(raw_mileage.get("value") or raw_mileage.get("name") or ""),
+                    max_value=MAX_MILEAGE,
+                )
+            else:
+                mileage = parse_number(str(raw_mileage or ""), max_value=MAX_MILEAGE) or parse_mileage(
+                    json.dumps(node, ensure_ascii=False)
+                )
 
-            seen_ids.add(ad_id)
-            results.append(
+            raw_price = node.get("price") or node.get("rawPrice") or node.get("amount")
+            if isinstance(raw_price, dict):
+                price = parse_price(
+                    str(
+                        raw_price.get("value")
+                        or raw_price.get("amount")
+                        or raw_price.get("priceFormatted")
+                        or ""
+                    )
+                )
+            else:
+                price = parse_price(str(raw_price or ""))
+
+            link = _absolute_link(str(url))
+            ad_id = str(node.get("id") or node.get("identifier") or _extract_id(link))
+            description = (
+                node.get("description")
+                or node.get("subtitle")
+                or vehicle.get("subtitle")
+                or title
+            )
+            if vehicle:
+                make = vehicle.get("make") or ""
+                model = vehicle.get("model") or ""
+                version = vehicle.get("modelVersionInput") or ""
+                title = " ".join(part for part in [make, model, version] if part).strip() or title
+
+            parsed_ads.append(
                 Ad(
                     source="AutoScout24",
                     ad_id=ad_id,
@@ -123,4 +229,70 @@ def scrape_autoscout(session: Session) -> List[Ad]:
                     link=link,
                 )
             )
+
+    return parsed_ads
+
+
+def scrape_autoscout(session: Session) -> List[Ad]:
+    results: List[Ad] = []
+    seen_ids: set[str] = set()
+
+    for make, model in SEARCHES:
+        for page in range(1, MAX_PAGES + 1):
+            url = build_url(make, model, page)
+            logging.info("AutoScout request make=%s model=%s page=%s url=%s", make, model, page, url)
+
+            try:
+                html = _fetch_page(session, url)
+            except Exception as exc:
+                logging.exception(
+                    "AutoScout request failed make=%s model=%s page=%s: %s",
+                    make,
+                    model,
+                    page,
+                    exc,
+                )
+                continue
+
+            soup = BeautifulSoup(html, "html.parser")
+            items = soup.select("article") or soup.select("[data-testid='listing']")
+            print(f"[AUTOSCOUT] {make} {model} page {page} -> {len(items)} items")
+            logging.debug("AutoScout DOM items make=%s model=%s page=%s count=%s", make, model, page, len(items))
+
+            json_ads = _extract_json_ads(html)
+            logging.info(
+                "AutoScout JSON parsed make=%s model=%s page=%s count=%s",
+                make,
+                model,
+                page,
+                len(json_ads),
+            )
+            parsed_ads = json_ads or _extract_article_ads(items)
+
+            if not parsed_ads:
+                logging.warning("AutoScout parsed 0 ads make=%s model=%s page=%s", make, model, page)
+                continue
+
+            page_added = 0
+            for ad in parsed_ads:
+                if not ad.title or not ad.link or not ad.ad_id:
+                    logging.debug("AutoScout skipped incomplete ad make=%s model=%s page=%s", make, model, page)
+                    continue
+                if ad.ad_id in seen_ids:
+                    logging.debug("AutoScout duplicate ad_id=%s", ad.ad_id)
+                    continue
+
+                seen_ids.add(ad.ad_id)
+                results.append(ad)
+                page_added += 1
+
+            logging.info(
+                "AutoScout parsed make=%s model=%s page=%s added=%s cumulative=%s",
+                make,
+                model,
+                page,
+                page_added,
+                len(results),
+            )
+
     return results

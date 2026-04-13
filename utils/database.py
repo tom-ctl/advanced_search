@@ -31,26 +31,89 @@ class Database:
                     mileage INTEGER,
                     label TEXT,
                     score REAL,
-                    notified_at TEXT
+                    first_notified_at TEXT,
+                    last_notified_at TEXT,
+                    last_seen_at TEXT
                 )
                 """
             )
+            existing_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(seen_ads)").fetchall()
+            }
+            for column_name, column_type in [
+                ("first_notified_at", "TEXT"),
+                ("last_notified_at", "TEXT"),
+                ("last_seen_at", "TEXT"),
+            ]:
+                if column_name not in existing_columns:
+                    conn.execute(f"ALTER TABLE seen_ads ADD COLUMN {column_name} {column_type}")
+
+            if "notified_at" in existing_columns:
+                conn.execute(
+                    """
+                    UPDATE seen_ads
+                    SET first_notified_at = COALESCE(first_notified_at, notified_at),
+                        last_notified_at = COALESCE(last_notified_at, notified_at),
+                        last_seen_at = COALESCE(last_seen_at, notified_at)
+                    """
+                )
             conn.commit()
 
-    def has_seen(self, storage_id: str) -> bool:
+    def get_entry(self, storage_id: str) -> Optional[sqlite3.Row]:
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT 1 FROM seen_ads WHERE storage_id = ? LIMIT 1",
+            return conn.execute(
+                """
+                SELECT storage_id, source, ad_id, title, price, mileage, label, score,
+                       first_notified_at, last_notified_at, last_seen_at
+                FROM seen_ads
+                WHERE storage_id = ?
+                LIMIT 1
+                """,
                 (storage_id,),
             ).fetchone()
-            return row is not None
 
-    def mark_seen(self, ad: Ad, storage_id: str) -> None:
+    def should_notify(self, ad: Ad, storage_id: str) -> tuple[bool, str]:
+        existing = self.get_entry(storage_id)
+        if existing is None:
+            return True, "new"
+
+        previous_price = existing["price"]
+        if previous_price != ad.price:
+            return True, "price_changed"
+
+        return False, "already_sent_same_price"
+
+    def upsert_ad(self, ad: Ad, storage_id: str, notified: bool) -> None:
         timestamp = datetime.utcnow().isoformat()
         with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT first_notified_at FROM seen_ads WHERE storage_id = ? LIMIT 1",
+                (storage_id,),
+            ).fetchone()
+            first_notified_at = existing["first_notified_at"] if existing else None
+            if notified and not first_notified_at:
+                first_notified_at = timestamp
+
+            last_notified_at = timestamp if notified else None
             conn.execute(
-                "INSERT OR IGNORE INTO seen_ads (storage_id, source, ad_id, title, price, mileage, label, score, notified_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                """
+                INSERT INTO seen_ads (
+                    storage_id, source, ad_id, title, price, mileage, label, score,
+                    first_notified_at, last_notified_at, last_seen_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(storage_id) DO UPDATE SET
+                    source = excluded.source,
+                    ad_id = excluded.ad_id,
+                    title = excluded.title,
+                    price = excluded.price,
+                    mileage = excluded.mileage,
+                    label = excluded.label,
+                    score = excluded.score,
+                    first_notified_at = COALESCE(seen_ads.first_notified_at, excluded.first_notified_at),
+                    last_notified_at = COALESCE(excluded.last_notified_at, seen_ads.last_notified_at),
+                    last_seen_at = excluded.last_seen_at
+                """,
                 (
                     storage_id,
                     ad.source,
@@ -60,6 +123,8 @@ class Database:
                     ad.mileage,
                     ad.label,
                     ad.score,
+                    first_notified_at,
+                    last_notified_at,
                     timestamp,
                 ),
             )

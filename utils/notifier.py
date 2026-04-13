@@ -9,6 +9,7 @@ class TelegramNotifier:
         self.base_url = f"https://api.telegram.org/bot{bot_token}"
         self.chat_id = chat_id
         self.session = requests.Session()
+        self.session.trust_env = False
         self.session.headers.update(
             {
                 "User-Agent": (
@@ -28,15 +29,23 @@ class TelegramNotifier:
         }
 
     def send_message(self, message: str) -> bool:
+        logging.info("Sending Telegram notification")
+        print("DEBUG TELEGRAM SEND:", message)
         url = f"{self.base_url}/sendMessage"
         try:
-            response = self.session.post(url, data=self._payload(message), timeout=15)
+            response = self.session.post(
+                url,
+                data=self._payload(message),
+                timeout=15,
+            )
+            print("TELEGRAM STATUS:", response.status_code, response.text)
             response.raise_for_status()
             data = response.json()
             if not data.get("ok"):
-                logging.warning("Telegram API rejected message: %s", data)
+                print("TELEGRAM RESPONSE ERROR:", data)
                 return False
             return True
         except Exception as exc:
+            print("TELEGRAM ERROR:", exc)
             logging.exception("Telegram notification failed: %s", exc)
             return False

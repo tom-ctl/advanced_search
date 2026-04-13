@@ -1,25 +1,25 @@
-﻿import logging
+import logging
 import os
 import random
 import time
-from typing import List
+from typing import List, Optional
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from scraper import scrape_autoscout, scrape_mobilede, scrape_leboncoin
+from scraper import scrape_autoscout, scrape_leboncoin
 from utils.database import Database
-from utils.filters import is_valid_ad
+from utils.filters import DEBUG, is_valid_ad
 from utils.models import Ad
+from utils.notifier import TelegramNotifier
+from utils.pricing import score_ad
 
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 DEFAULT_SLEEP_SECONDS = 7200
 SLEEP_VARIANCE_SECONDS = 600
-MIN_REQUEST_DELAY_SECONDS = 5
-MAX_REQUEST_DELAY_SECONDS = 15
-MIN_KEYWORD_DELAY_SECONDS = 30
-MAX_KEYWORD_DELAY_SECONDS = 90
+MIN_REQUEST_DELAY_SECONDS = 2
+MAX_REQUEST_DELAY_SECONDS = 5
 
 
 def configure_logging() -> None:
@@ -32,6 +32,7 @@ def configure_logging() -> None:
 
 def create_session() -> requests.Session:
     session = requests.Session()
+    session.trust_env = False
     session.headers.update(
         {
             "User-Agent": (
@@ -40,8 +41,7 @@ def create_session() -> requests.Session:
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
+            "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
             "Connection": "keep-alive",
         }
     )
@@ -58,20 +58,48 @@ def create_session() -> requests.Session:
     return session
 
 
+def create_notifier() -> Optional[TelegramNotifier]:
+    bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not bot_token or not chat_id:
+        logging.info("Telegram notifier disabled because TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing")
+        return None
+
+    logging.info("Telegram notifier enabled")
+    return TelegramNotifier(bot_token=bot_token, chat_id=chat_id)
+
+
 def print_ad(ad: Ad) -> None:
     print("Title:", ad.title)
-    print("Price:", f"{ad.price:,} €")
-    print("Mileage:", f"{ad.mileage:,} km")
+    print("Price:", f"{ad.price:,} EUR" if ad.price is not None else "N/A")
+    print("Mileage:", f"{ad.mileage:,} km" if ad.mileage is not None else "N/A")
     print("Link:", ad.link)
     print("Source:", ad.source)
     print("-")
 
 
-def run_cycle(session: requests.Session, db: Database) -> None:
+def format_telegram_message(ad: Ad) -> str:
+    label = ad.label or "OK"
+    price = f"{ad.price:,} EUR" if ad.price is not None else "N/A"
+    mileage = f"{ad.mileage:,} km" if ad.mileage is not None else "N/A"
+    score = f"{ad.score:.3f}" if ad.score is not None else "N/A"
+    market_price = f"{ad.market_price:,} EUR" if ad.market_price is not None else "N/A"
+    return (
+        f"{label}\n"
+        f"{ad.title}\n"
+        f"Prix: {price}\n"
+        f"Kilometrage: {mileage}\n"
+        f"Prix marche estime: {market_price}\n"
+        f"Score: {score}\n"
+        f"Source: {ad.source}\n"
+        f"{ad.link}"
+    )
+
+
+def run_cycle(session: requests.Session, db: Database, notifier: Optional[TelegramNotifier]) -> None:
     logging.info("Starting full scan cycle")
     scraper_functions = [
         ("AutoScout24", scrape_autoscout),
-        ("Mobile.de", scrape_mobilede),
         ("Leboncoin", scrape_leboncoin),
     ]
     all_ads: List[Ad] = []
@@ -83,40 +111,66 @@ def run_cycle(session: requests.Session, db: Database) -> None:
             all_ads.extend(site_ads)
         except Exception as exc:
             logging.exception("Scraper %s failed: %s", source_name, exc)
+
         time.sleep(random.uniform(MIN_REQUEST_DELAY_SECONDS, MAX_REQUEST_DELAY_SECONDS))
 
-    logging.info("Total ads collected before duplicate filter: %d", len(all_ads))
-    processed_ids: set[str] = set()
+    print(f"TOTAL SCRAPED: {len(all_ads)}")
 
+    valid_ads: List[Ad] = []
     for ad in all_ads:
+        valid, reason = is_valid_ad(ad.title, ad.description, ad.price, ad.mileage)
+        if not valid:
+            if DEBUG:
+                print(f"[REJECTED - {reason}] {ad.title} | {ad.price}EUR | {ad.mileage}km | {ad.source}")
+            continue
+
+        if ad.price is not None and ad.mileage is not None:
+            market_price, score, label = score_ad(ad.price, ad.mileage)
+            ad.market_price = market_price
+            ad.score = score
+            ad.label = label
+
+        if DEBUG:
+            print(f"[ACCEPTED] {ad.title} | {ad.price}EUR | {ad.mileage}km | {ad.source}")
+        valid_ads.append(ad)
+
+    print(f"VALID ADS: {len(valid_ads)}")
+
+    processed_ids: set[str] = set()
+    for ad in valid_ads:
         if ad.ad_id in processed_ids:
+            logging.debug("Duplicate ad within cycle %s:%s", ad.source, ad.ad_id)
             continue
 
         processed_ids.add(ad.ad_id)
-
-        if not is_valid_ad(ad.title, ad.description, ad.price, ad.mileage):
-            logging.debug("Filtered out ad %s from %s", ad.ad_id, ad.source)
-            continue
-
         storage_id = f"{ad.source}:{ad.ad_id}"
-        if db.has_seen(storage_id):
-            logging.debug("Already processed ad %s", storage_id)
+        should_notify, reason = db.should_notify(ad, storage_id)
+        if not should_notify:
+            if DEBUG:
+                print(f"[SKIPPED - {reason}] {storage_id} | current_price={ad.price}")
+            db.upsert_ad(ad, storage_id, notified=False)
             continue
 
         print_ad(ad)
-        db.mark_seen(ad, storage_id)
+        if DEBUG:
+            print(f"[NOTIFY - {reason}] {storage_id} | current_price={ad.price}")
+        if notifier is not None:
+            sent = notifier.send_message(format_telegram_message(ad))
+            logging.info("Telegram send status for %s: %s", storage_id, sent)
+        db.upsert_ad(ad, storage_id, notified=True)
 
     logging.info("Scan cycle complete")
 
 
 def main() -> None:
     configure_logging()
-    db = Database("seen_ads.db")
+    db = Database("car_alerts.db")
     session = create_session()
+    notifier = create_notifier()
 
     while True:
         try:
-            run_cycle(session, db)
+            run_cycle(session, db, notifier)
         except Exception:
             logging.exception("Unexpected error during scan cycle")
 

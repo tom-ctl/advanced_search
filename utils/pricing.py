@@ -14,9 +14,9 @@ def score_ad(price: int, mileage: int) -> Tuple[int, float, str]:
     market_price = estimate_market_price(mileage)
     score = round((market_price - price) / market_price, 3)
     if score > 0.3:
-        label = "🔥 EXCELLENT DEAL"
+        label = "EXCELLENT DEAL"
     elif score > 0.1:
-        label = "👍 GOOD DEAL"
+        label = "GOOD DEAL"
     else:
         label = "OK"
     return market_price, score, label

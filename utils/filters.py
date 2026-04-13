@@ -1,86 +1,142 @@
-﻿import re
-from typing import List, Optional
+import re
+import unicodedata
+from typing import List, Optional, Tuple
 
-from .normalization import normalize_for_matching, normalize_text, normalize_keyword
+DEBUG = True
+MAX_PRICE = 15000
+MAX_MILEAGE = 250000
 
-BASE_KEYWORDS: List[str] = [
+SEARCH_KEYWORDS: List[str] = [
     "navara",
     "l200",
-    "triton",
     "hilux",
     "ranger",
-    "raptor",
-    "wildtrack",
     "bt-50",
     "bt50",
     "b2500",
+    "dmax",
     "pickup",
+    "pick up",
+    "pick-up",
     "landcruiser",
     "land cruiser",
     "patrol",
-    "gladiator",
     "ram",
 ]
 
-EXTENDED_KEYWORDS: List[str] = [
-    "4x4",
-    "tout terrain",
-    "offroad",
-    "utilitaire 4x4",
-    "double cabine",
+MATCH_KEYWORDS: List[str] = [
+    "navara",
+    "l200",
+    "hilux",
+    "ranger",
+    "bt50",
+    "b2500",
+    "dmax",
+    "pickup",
     "pick up",
     "pick-up",
-    "camionnette 4x4",
-    "benne",
-    "plateau",
-    "nissan pickup",
-    "toyota pickup",
-    "mitsubishi pickup",
-    "ford pickup",
-    "mazda pickup",
-    "dodge ram",
-    "jeep pickup",
-    "suv 4x4",
+    "landcruiser",
+    "patrol",
+    "ram",
 ]
 
-SEARCH_KEYWORDS = BASE_KEYWORDS + EXTENDED_KEYWORDS
-SEARCH_KEYWORDS_NORMALIZED = [normalize_keyword(word) for word in SEARCH_KEYWORDS]
+MATCH_KEYWORDS_NORMALIZED = [
+    re.sub(r"[\s\-]", "", keyword.lower()) for keyword in MATCH_KEYWORDS
+]
+
+
+def parse_number(text: str, max_value: Optional[int] = None) -> Optional[int]:
+    if not text:
+        return None
+
+    chunks = re.findall(r"\d[\d\s.,]*", text.replace("\u00a0", " "))
+    candidates = []
+    for chunk in chunks:
+        digits = re.sub(r"[^\d]", "", chunk)
+        if not digits:
+            continue
+        value = int(digits)
+        if max_value is not None and value > max_value:
+            continue
+        candidates.append(value)
+
+    if not candidates:
+        return None
+
+    return max(candidates)
+
+
+def normalize_text(text: str) -> str:
+    cleaned = unicodedata.normalize("NFD", text or "")
+    cleaned = "".join(ch for ch in cleaned if unicodedata.category(ch) != "Mn")
+    return cleaned.lower()
+
+
+def normalize(text: str) -> str:
+    text = normalize_text(text)
+    return re.sub(r"[\s\-]", "", text)
+
+
+def parse_price(text: str) -> Optional[int]:
+    return parse_number(text, max_value=100000)
 
 
 def parse_integer(raw: str) -> Optional[int]:
-    if not raw:
+    return parse_price(raw)
+
+
+def parse_mileage(text: str) -> Optional[int]:
+    if not text:
         return None
 
-    cleaned = re.sub(r"[\u00A0\s\.,]+", "", raw)
-    if not cleaned.isdigit():
+    match = re.search(
+        r"(\d[\d\s.,]*)\s*(?:km|kilometres?|kilometers?)",
+        normalize_text(text),
+        re.IGNORECASE,
+    )
+    if not match:
         return None
 
-    return int(cleaned)
+    return parse_number(match.group(1), max_value=MAX_MILEAGE)
 
 
-def contains_keyword(text: str) -> bool:
-    normalized = normalize_for_matching(text)
-    return any(keyword in normalized for keyword in SEARCH_KEYWORDS_NORMALIZED)
+def match_keywords(title: str, description: str) -> bool:
+    text = normalize(f"{title} {description}")
+    return any(keyword in text for keyword in MATCH_KEYWORDS_NORMALIZED)
 
 
-def contains_hs(text: str) -> bool:
-    normalized = normalize_text(text)
-    return bool(re.search(r"\bhs\b", normalized))
+def is_valid(ad: dict) -> Tuple[bool, str]:
+    price = ad.get("price")
+    mileage = ad.get("km")
+    title = ad.get("title") or ""
+    description = ad.get("description") or ""
+
+    if not match_keywords(title, description):
+        return False, "keyword"
+    if price is None:
+        return False, "no_price"
+    if mileage is None:
+        return False, "no_km"
+    if price > MAX_PRICE:
+        return False, "price"
+    if mileage > MAX_MILEAGE:
+        return False, "km"
+    if "hs" in normalize(title):
+        return False, "hs"
+    return True, "ok"
 
 
-def is_valid_ad(title: str, description: str, price: Optional[int], mileage: Optional[int]) -> bool:
-    if price is None or mileage is None:
-        return False
-    if price >= 10000:
-        return False
-    if mileage >= 250000:
-        return False
-
-    combined = f"{title} {description}"
-    if contains_hs(combined):
-        return False
-
-    if not contains_keyword(combined):
-        return False
-
-    return True
+def is_valid_ad(
+    title: str,
+    description: str,
+    price: Optional[int],
+    mileage: Optional[int],
+) -> Tuple[bool, str]:
+    return is_valid(
+        {
+            "title": title,
+            "description": description,
+            "price": price,
+            "km": mileage,
+        }
+    )
