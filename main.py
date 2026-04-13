@@ -20,11 +20,16 @@ from utils.models import Ad
 LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 DEFAULT_SLEEP_SECONDS = 7200
 SLEEP_VARIANCE_SECONDS = 600
+MIN_SCRAPER_DELAY_SECONDS = 12
+MAX_SCRAPER_DELAY_SECONDS = 20
 
 
 def configure_logging() -> None:
-    logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, log_level, logging.INFO)
+    logging.basicConfig(level=level, format=LOG_FORMAT)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.debug("Logging configured at %s level", logging.getLevelName(level))
 
 
 def create_session() -> requests.Session:
@@ -80,6 +85,24 @@ def format_message(ad: Ad) -> str:
     )
 
 
+def _log_filter_reason(ad: Ad) -> None:
+    if ad.price is None:
+        logging.debug("Filtered out ad %s because price is missing: %s", ad.ad_id, ad.link)
+        return
+    if ad.mileage is None:
+        logging.debug("Filtered out ad %s because mileage is missing: %s", ad.ad_id, ad.link)
+        return
+    if not is_valid_ad(ad):
+        logging.debug(
+            "Filtered out ad %s because it does not meet rules (price=%s, mileage=%s): %s",
+            ad.ad_id,
+            ad.price,
+            ad.mileage,
+            ad.link,
+        )
+        return
+
+
 def run_cycle(session: requests.Session, db: Database, notifier: TelegramNotifier) -> None:
     logging.info("Starting scrape cycle")
 
@@ -96,17 +119,15 @@ def run_cycle(session: requests.Session, db: Database, notifier: TelegramNotifie
             ads = scraper(session)
             logging.info("Found %d ads on %s", len(ads), source_name)
             all_ads.extend(ads)
-            time.sleep(random.uniform(2.0, 4.0))
+            time.sleep(random.uniform(MIN_SCRAPER_DELAY_SECONDS, MAX_SCRAPER_DELAY_SECONDS))
         except Exception as exc:
             logging.exception("Failed to scrape %s: %s", source_name, exc)
 
     logging.info("Total ads collected: %d", len(all_ads))
 
     for ad in all_ads:
-        if not is_valid_ad(ad):
-            continue
-
-        if ad.price is None or ad.mileage is None:
+        if not is_valid_ad(ad) or ad.price is None or ad.mileage is None:
+            _log_filter_reason(ad)
             continue
 
         ad.market_price, ad.score, ad.label = score_ad(ad.price, ad.mileage)

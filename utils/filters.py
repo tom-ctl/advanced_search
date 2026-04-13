@@ -4,6 +4,23 @@ from typing import Optional
 
 from .models import Ad
 
+SEARCH_KEYWORDS = [
+    "navara",
+    "l200",
+    "triton",
+    "hilux",
+    "ranger",
+    "raptor",
+    "wildtrack",
+    "bt-50",
+    "b2500",
+    "pickup",
+    "landcruiser",
+    "patrol",
+    "gladiator",
+    "ram",
+]
+
 KEYWORD_PATTERNS = [
     r"navara",
     r"l[-_ ]*200",
@@ -66,7 +83,8 @@ def is_valid_ad(ad: Ad) -> bool:
     if ad.mileage >= 250000:
         return False
 
-    if "hs" in normalize_text(ad.description):
+    normalized_desc = normalize_text(ad.description)
+    if re.search(r"\bhs\b", normalized_desc):
         return False
 
     return True

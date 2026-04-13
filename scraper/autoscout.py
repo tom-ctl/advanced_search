@@ -7,19 +7,37 @@ from typing import List, Optional
 from bs4 import BeautifulSoup
 from requests import Session
 
-from utils.filters import parse_integer, normalize_text
+from urllib.parse import quote_plus
+
+from utils.filters import parse_integer, normalize_text, SEARCH_KEYWORDS
 from utils.models import Ad
 
-SEARCH_URL = (
+SEARCH_URL_TEMPLATE = (
     "https://www.autoscout24.com/lst?sort=standard&desc=0&offer=used&price_to=10000"
-    "&kmto=250000&cy=FR&atype=C"
+    "&kmto=250000&cy=FR&atype=C&q={keyword}"
 )
 
 
+def _browser_headers() -> dict[str, str]:
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Referer": "https://www.autoscout24.com/",
+    }
+
+
 def _fetch_page(session: Session, url: str) -> str:
-    response = session.get(url, timeout=20)
+    session.get("https://www.autoscout24.com", timeout=20, headers=_browser_headers())
+    response = session.get(url, timeout=20, headers=_browser_headers())
     response.raise_for_status()
-    time.sleep(random.uniform(1.5, 3.0))
+    time.sleep(random.uniform(6.0, 10.0))
     return response.text
 
 
@@ -56,40 +74,53 @@ def _extract_id(link: str) -> str:
 
 
 def scrape_autoscout(session: Session) -> List[Ad]:
-    logging.info("Loading AutoScout24 search page")
-    html = _fetch_page(session, SEARCH_URL)
-    soup = BeautifulSoup(html, "html.parser")
-    items = soup.find_all("article") or soup.select("div[data-item-name='listing']")
     results: List[Ad] = []
+    seen_ids: set[str] = set()
 
-    for item in items:
-        link_tag = item.find("a", href=True)
-        if not link_tag:
-            continue
-        link = link_tag["href"]
-        if link.startswith("/"):
-            link = "https://www.autoscout24.com" + link
-
-        title = _extract_text(item.select_one("h2")) or _extract_text(link_tag)
-        price = _find_price(item)
-        mileage = _find_mileage(item)
-        description = _extract_text(item.select_one("p"))
-        if not description:
-            description = normalize_text(_extract_text(item))
-
-        ad_id = _extract_id(link)
-        if not title or not ad_id:
+    for keyword in SEARCH_KEYWORDS:
+        search_url = SEARCH_URL_TEMPLATE.format(keyword=quote_plus(keyword))
+        logging.info("Loading AutoScout24 search page for '%s'", keyword)
+        try:
+            html = _fetch_page(session, search_url)
+        except Exception as exc:
+            logging.warning("AutoScout24 request failed for '%s': %s", keyword, exc)
             continue
 
-        results.append(
-            Ad(
-                source="AutoScout24",
-                ad_id=ad_id,
-                title=title,
-                price=price,
-                mileage=mileage,
-                description=description,
-                link=link,
+        soup = BeautifulSoup(html, "html.parser")
+        items = soup.find_all("article") or soup.select("div[data-item-name='listing']")
+
+        for item in items:
+            link_tag = item.find("a", href=True)
+            if not link_tag:
+                continue
+            link = link_tag["href"]
+            if link.startswith("/"):
+                link = "https://www.autoscout24.com" + link
+
+            title = _extract_text(item.select_one("h2")) or _extract_text(link_tag)
+            price = _find_price(item)
+            mileage = _find_mileage(item)
+            description = _extract_text(item.select_one("p"))
+            if not description:
+                description = normalize_text(_extract_text(item))
+
+            ad_id = _extract_id(link)
+            if not title or not ad_id:
+                continue
+
+            if ad_id in seen_ids:
+                continue
+
+            seen_ids.add(ad_id)
+            results.append(
+                Ad(
+                    source="AutoScout24",
+                    ad_id=ad_id,
+                    title=title,
+                    price=price,
+                    mileage=mileage,
+                    description=description,
+                    link=link,
+                )
             )
-        )
     return results
