@@ -2,6 +2,7 @@ import logging
 import os
 import random
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional
 
@@ -10,6 +11,8 @@ from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+import scraper.autoscout as autoscout_module
+import scraper.leboncoin as leboncoin_module
 from scraper import scrape_autoscout, scrape_leboncoin
 from utils.database import Database
 from utils.filters import DEBUG, is_valid_ad
@@ -104,6 +107,33 @@ def format_telegram_message(ad: Ad) -> str:
     )
 
 
+def _format_scraper_status(name: str, status: dict) -> str:
+    state = status.get("status", "unknown")
+    count = status.get("count", 0)
+    message = status.get("message", "") or "no detail"
+    return f"{name}: {state} | ads={count} | {message}"
+
+
+def format_heartbeat_message(
+    site_statuses: List[tuple[str, dict]],
+    total_scraped: int,
+    valid_ads: int,
+    sent_ads: int,
+) -> str:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = [
+        "Heartbeat scraping",
+        f"Heure: {timestamp}",
+        f"Total scrape: {total_scraped}",
+        f"Total valides: {valid_ads}",
+        f"Envoyees Telegram: {sent_ads}",
+        "",
+    ]
+    for source_name, status in site_statuses:
+        lines.append(_format_scraper_status(source_name, status))
+    return "\n".join(lines)
+
+
 def run_cycle(session: requests.Session, db: Database, notifier: Optional[TelegramNotifier]) -> None:
     logging.info("Starting full scan cycle")
     scraper_functions = [
@@ -111,6 +141,7 @@ def run_cycle(session: requests.Session, db: Database, notifier: Optional[Telegr
         ("Leboncoin", scrape_leboncoin),
     ]
     all_ads: List[Ad] = []
+    site_statuses: List[tuple[str, dict]] = []
 
     for source_name, scraper_func in scraper_functions:
         try:
@@ -119,6 +150,11 @@ def run_cycle(session: requests.Session, db: Database, notifier: Optional[Telegr
             all_ads.extend(site_ads)
         except Exception as exc:
             logging.exception("Scraper %s failed: %s", source_name, exc)
+        finally:
+            if source_name == "AutoScout24":
+                site_statuses.append((source_name, dict(autoscout_module.LAST_STATUS)))
+            elif source_name == "Leboncoin":
+                site_statuses.append((source_name, dict(leboncoin_module.LAST_STATUS)))
 
         time.sleep(random.uniform(MIN_REQUEST_DELAY_SECONDS, MAX_REQUEST_DELAY_SECONDS))
 
@@ -145,6 +181,7 @@ def run_cycle(session: requests.Session, db: Database, notifier: Optional[Telegr
     print(f"VALID ADS: {len(valid_ads)}")
 
     processed_ids: set[str] = set()
+    sent_ads = 0
     for ad in valid_ads:
         if ad.ad_id in processed_ids:
             logging.debug("Duplicate ad within cycle %s:%s", ad.source, ad.ad_id)
@@ -169,7 +206,19 @@ def run_cycle(session: requests.Session, db: Database, notifier: Optional[Telegr
         else:
             logging.warning("Telegram notifier unavailable, ad not sent for %s", storage_id)
 
+        if sent:
+            sent_ads += 1
         db.upsert_ad(ad, storage_id, notified=sent)
+
+    if notifier is not None:
+        heartbeat = format_heartbeat_message(
+            site_statuses=site_statuses,
+            total_scraped=len(all_ads),
+            valid_ads=len(valid_ads),
+            sent_ads=sent_ads,
+        )
+        heartbeat_sent = notifier.send_message(heartbeat)
+        logging.info("Heartbeat send status: %s", heartbeat_sent)
 
     logging.info("Scan cycle complete")
 

@@ -11,6 +11,7 @@ from utils.models import Ad
 
 BASE_URL = "https://www.autoscout24.fr"
 MAX_PAGES = 5
+LAST_STATUS = {"status": "idle", "count": 0, "message": ""}
 SEARCHES = [
     ("toyota", "hilux"),
     ("mitsubishi", "l200"),
@@ -18,6 +19,12 @@ SEARCHES = [
     ("ford", "ranger"),
     ("mazda", "bt-50"),
 ]
+
+
+def _set_status(status: str, count: int = 0, message: str = "") -> None:
+    LAST_STATUS["status"] = status
+    LAST_STATUS["count"] = count
+    LAST_STATUS["message"] = message
 
 
 def build_url(make: str, model: str, page: int) -> str:
@@ -61,6 +68,11 @@ def _fetch_page(session: Session, url: str) -> str:
     response = session.get(url, headers=_browser_headers(), timeout=30)
     response.raise_for_status()
     return response.text
+
+
+def _is_blocked_html(html: str) -> bool:
+    lowered = html.lower()
+    return "datadome" in lowered or "captcha" in lowered or "temporarily restricted" in lowered
 
 
 def _extract_price(item: BeautifulSoup, text_blob: str) -> Optional[int]:
@@ -234,6 +246,7 @@ def _extract_json_ads(html: str) -> List[Ad]:
 
 
 def scrape_autoscout(session: Session) -> List[Ad]:
+    _set_status("running", 0, "scan started")
     results: List[Ad] = []
     seen_ids: set[str] = set()
 
@@ -245,6 +258,7 @@ def scrape_autoscout(session: Session) -> List[Ad]:
             try:
                 html = _fetch_page(session, url)
             except Exception as exc:
+                _set_status("error", len(results), f"{make} {model} page {page}: {exc}")
                 logging.exception(
                     "AutoScout request failed make=%s model=%s page=%s: %s",
                     make,
@@ -253,6 +267,12 @@ def scrape_autoscout(session: Session) -> List[Ad]:
                     exc,
                 )
                 continue
+
+            if _is_blocked_html(html):
+                message = f"blocked on {make} {model} page {page}"
+                _set_status("blocked", len(results), message)
+                logging.warning("AutoScout block detected: %s", message)
+                return results
 
             soup = BeautifulSoup(html, "html.parser")
             items = soup.select("article") or soup.select("[data-testid='listing']")
@@ -295,4 +315,8 @@ def scrape_autoscout(session: Session) -> List[Ad]:
                 len(results),
             )
 
+    if results:
+        _set_status("ok", len(results), "ads collected")
+    else:
+        _set_status("empty", 0, "no ads collected")
     return results

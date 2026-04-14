@@ -1,141 +1,129 @@
 import logging
-import os
 import random
 import time
-from typing import Any, List, Optional
+from pathlib import Path
+from typing import List, Optional
 from urllib.parse import quote_plus
 
 from bs4 import BeautifulSoup
-from requests import Response, Session
 
-from utils.filters import MAX_MILEAGE, MAX_PRICE, SEARCH_KEYWORDS, parse_mileage, parse_number, parse_price
+from utils.filters import MAX_MILEAGE, MAX_PRICE, SEARCH_KEYWORDS, parse_mileage, parse_price
 from utils.models import Ad
 
-API_URL = "https://api.leboncoin.fr/finder/search"
-SEARCH_URL_TEMPLATE = (
-    "https://www.leboncoin.fr/recherche?category=2"
-    "&text={keyword}&price=max{max_price}&mileage=max{max_mileage}&page={page}"
-)
+DEBUG = True
+SESSION_PATH = Path("session.json")
+DEBUG_HTML_PATH = Path("debug.html")
+DEBUG_SCREENSHOT_PATH = Path("debug.png")
 MAX_PAGES = 5
-PAGE_SIZE = 50
-MIN_BROWSER_PRELOAD_DELAY_SECONDS = 2
-MAX_BROWSER_PRELOAD_DELAY_SECONDS = 5
-LEBONCOIN_REQUEST_INTERVAL_SECONDS = 30
-BROWSER_LOAD_RETRIES = 3
-REALISTIC_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
+MAX_KEYWORDS_PER_RUN = 5
+LAST_STATUS = {"status": "idle", "count": 0, "message": ""}
+ACTION_BREAK_MIN_SECONDS = 2
+ACTION_BREAK_MAX_SECONDS = 5
+PAGE_LOAD_MIN_SECONDS = 5
+PAGE_LOAD_MAX_SECONDS = 12
+KEYWORD_BREAK_MIN_SECONDS = 15
+KEYWORD_BREAK_MAX_SECONDS = 40
+ERROR_BREAK_MIN_SECONDS = 30
+ERROR_BREAK_MAX_SECONDS = 60
+LONG_BREAK_MIN_SECONDS = 120
+LONG_BREAK_MAX_SECONDS = 300
+SOFT_BAN_BREAK_MIN_SECONDS = 600
+SOFT_BAN_BREAK_MAX_SECONDS = 1800
+IDLE_BREAK_MIN_SECONDS = 10
+IDLE_BREAK_MAX_SECONDS = 30
+REALISTIC_NAVIGATION_TIMEOUT_MS = 60000
+
+_ua = None
 
 
-def _api_headers() -> dict[str, str]:
-    return {
-        "User-Agent": REALISTIC_USER_AGENT,
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Origin": "https://www.leboncoin.fr",
-        "Referer": "https://www.leboncoin.fr/",
-    }
+def _set_status(status: str, count: int = 0, message: str = "") -> None:
+    LAST_STATUS["status"] = status
+    LAST_STATUS["count"] = count
+    LAST_STATUS["message"] = message
 
 
-def _payload(keyword: str, offset: int) -> dict[str, Any]:
-    return {
-        "filters": {
-            "category": {"id": "2"},
-            "enums": {"ad_type": ["offer"]},
-            "keywords": keyword,
-            "ranges": {
-                "price": {"max": MAX_PRICE},
-                "mileage": {"max": MAX_MILEAGE},
-            },
-        },
-        "limit": PAGE_SIZE,
-        "offset": offset,
-    }
+def human_delay(a: float = 2, b: float = 6) -> None:
+    time.sleep(random.uniform(a, b))
 
 
-def _extract_text(element: Optional[BeautifulSoup]) -> str:
-    return element.get_text(" ", strip=True) if element else ""
+def _get_user_agent_factory():
+    global _ua
+    if _ua is None:
+        from fake_useragent import UserAgent
+
+        _ua = UserAgent()
+    return _ua
 
 
-def _extract_mileage(attributes: list[dict[str, Any]]) -> Optional[int]:
-    for attr in attributes:
-        if attr.get("key") != "vehicle_mileage":
-            continue
-
-        raw_value = str(attr.get("value") or attr.get("values") or "")
-        mileage = parse_number(raw_value, max_value=MAX_MILEAGE)
-        if mileage is not None:
-            return mileage
-
-    return None
-
-
-def _extract_description(ad_data: dict[str, Any]) -> str:
-    description = ad_data.get("body") or ad_data.get("description") or ""
-    if description:
-        return description
-
-    parts: list[str] = []
-    for attr in ad_data.get("attributes", []):
-        value = attr.get("value_label") or attr.get("value") or ""
-        if value:
-            parts.append(str(value))
-    return " ".join(parts)
-
-
-def _extract_link(ad_data: dict[str, Any]) -> str:
-    raw_url = ad_data.get("url") or ad_data.get("list_url") or ""
-    if raw_url.startswith("/"):
-        return "https://www.leboncoin.fr" + raw_url
-    return raw_url
-
-
-def _parse_api_ad(ad_data: dict[str, Any]) -> Optional[Ad]:
-    title = (ad_data.get("subject") or "").strip()
-    if not title:
-        return None
-
-    price = None
-    raw_price = ad_data.get("price")
-    if isinstance(raw_price, list) and raw_price:
-        price = parse_price(str(raw_price[0]))
-    elif raw_price is not None:
-        price = parse_price(str(raw_price))
-
-    mileage = _extract_mileage(ad_data.get("attributes", []))
-    if mileage is None:
-        mileage = parse_mileage(_extract_description(ad_data))
-
-    link = _extract_link(ad_data)
-    ad_id = str(ad_data.get("list_id") or ad_data.get("ad_id") or link)
-    if not ad_id or not link:
-        return None
-
-    return Ad(
-        source="Leboncoin",
-        ad_id=ad_id,
-        title=title,
-        price=price,
-        mileage=mileage,
-        description=_extract_description(ad_data),
-        link=link,
-    )
+def get_random_user_agent() -> str:
+    return _get_user_agent_factory().random
 
 
 def _build_search_url(keyword: str, page: int) -> str:
-    return SEARCH_URL_TEMPLATE.format(
-        keyword=quote_plus(keyword),
-        max_price=MAX_PRICE,
-        max_mileage=MAX_MILEAGE,
-        page=page,
+    return (
+        "https://www.leboncoin.fr/recherche"
+        f"?category=2&text={quote_plus(keyword)}&price=max{MAX_PRICE}&mileage=max{MAX_MILEAGE}&page={page}"
     )
+
+
+def _extract_text(element) -> str:
+    return element.get_text(" ", strip=True) if element else ""
 
 
 def _extract_browser_ad_id(link: str) -> str:
     parts = [part for part in link.rstrip("/").split("/") if part]
     return parts[-1] if parts else link
+
+
+def _dump_debug_artifacts(page) -> None:
+    if not DEBUG:
+        return
+
+    try:
+        page.screenshot(path=str(DEBUG_SCREENSHOT_PATH), full_page=True)
+    except Exception as exc:
+        logging.warning("Leboncoin debug screenshot failed: %s", exc)
+
+    try:
+        DEBUG_HTML_PATH.write_text(page.content(), encoding="utf-8")
+    except Exception as exc:
+        logging.warning("Leboncoin debug html dump failed: %s", exc)
+
+
+def _idle_pause(reason: str, a: float = IDLE_BREAK_MIN_SECONDS, b: float = IDLE_BREAK_MAX_SECONDS) -> None:
+    pause = random.uniform(a, b)
+    logging.info("Leboncoin idle pause reason=%s duration=%.2fs", reason, pause)
+    time.sleep(pause)
+
+
+def _is_blocked(content: str) -> bool:
+    lowered = content.lower()
+    return "datadome" in lowered or "captcha" in lowered
+
+
+def _is_soft_banned(content: str) -> bool:
+    lowered = content.lower()
+    return "accès temporairement restreint" in lowered or "acces temporairement restreint" in lowered
+
+
+def simulate_human(page) -> None:
+    for _ in range(random.randint(3, 6)):
+        page.mouse.wheel(0, random.randint(200, 800))
+        human_delay(0.5, 2)
+
+
+def _slow_open_search(page, search_url: str) -> str:
+    page.goto("https://www.leboncoin.fr", wait_until="domcontentloaded", timeout=REALISTIC_NAVIGATION_TIMEOUT_MS)
+    human_delay(PAGE_LOAD_MIN_SECONDS, PAGE_LOAD_MAX_SECONDS)
+    _idle_pause("homepage_settle", PAGE_LOAD_MIN_SECONDS, PAGE_LOAD_MAX_SECONDS)
+
+    page.goto(search_url, wait_until="domcontentloaded", timeout=REALISTIC_NAVIGATION_TIMEOUT_MS)
+    human_delay(PAGE_LOAD_MIN_SECONDS, PAGE_LOAD_MAX_SECONDS)
+    simulate_human(page)
+    _idle_pause("search_settle")
+    content = page.content()
+    _dump_debug_artifacts(page)
+    return content
 
 
 def _parse_browser_results(html: str) -> List[Ad]:
@@ -157,6 +145,9 @@ def _parse_browser_results(html: str) -> List[Ad]:
             or _extract_text(item.select_one("h2"))
             or _extract_text(link_tag)
         )
+        if not title:
+            continue
+
         text_blob = " ".join(item.stripped_strings)
         price = None
         for text in item.stripped_strings:
@@ -165,10 +156,10 @@ def _parse_browser_results(html: str) -> List[Ad]:
             price = parse_price(text)
             if price is not None:
                 break
+
         mileage = parse_mileage(text_blob)
         ad_id = _extract_browser_ad_id(link)
-
-        if not title or not ad_id:
+        if not ad_id:
             continue
 
         parsed_ads.append(
@@ -186,181 +177,167 @@ def _parse_browser_results(html: str) -> List[Ad]:
     return parsed_ads
 
 
-def _is_datadome_blocked(response: Response) -> bool:
-    if response.status_code != 403:
-        return False
-    if response.headers.get("x-datadome") == "protected":
-        return True
-    return "captcha-delivery.com" in response.text or "datadome" in response.text.lower()
+def _selected_keywords() -> List[str]:
+    return SEARCH_KEYWORDS[:MAX_KEYWORDS_PER_RUN]
 
 
-def _throttle_request() -> None:
-    logging.info("Leboncoin throttle sleep for %s seconds", LEBONCOIN_REQUEST_INTERVAL_SECONDS)
-    time.sleep(LEBONCOIN_REQUEST_INTERVAL_SECONDS)
+def _maybe_long_pause(keyword_index: int, next_break_after: int) -> int:
+    if keyword_index > 0 and keyword_index % next_break_after == 0:
+        pause = random.uniform(LONG_BREAK_MIN_SECONDS, LONG_BREAK_MAX_SECONDS)
+        logging.info("Leboncoin long human pause for %.2f seconds", pause)
+        time.sleep(pause)
+        return random.randint(3, 5)
+    return next_break_after
 
 
-def _create_webdriver():
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options
+def scrape_leboncoin(session) -> List[Ad]:
+    del session
 
-    chrome_path = os.getenv("LEBONCOIN_CHROME_BINARY", r"C:\Program Files\Google\Chrome\Application\chrome.exe")
-    edge_path = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
-    binary_location = chrome_path if os.path.exists(chrome_path) else edge_path if os.path.exists(edge_path) else None
-    if not binary_location:
-        raise FileNotFoundError("No Chrome/Edge binary found for Leboncoin browser fallback")
-
-    headless = os.getenv("LEBONCOIN_BROWSER_HEADLESS", "0") == "1"
-    options = Options()
-    options.binary_location = binary_location
-    options.add_argument(f"--user-agent={REALISTIC_USER_AGENT}")
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--window-size=1400,1000")
-    options.add_experimental_option("excludeSwitches", ["enable-automation"])
-    options.add_experimental_option("useAutomationExtension", False)
-    if headless:
-        options.add_argument("--headless=new")
-
-    driver = webdriver.Chrome(options=options)
-    driver.execute_script(
-        "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-    )
-    return driver, binary_location, headless
-
-
-def _load_browser_page(url: str) -> Optional[str]:
-    try:
-        from selenium.common.exceptions import WebDriverException
-    except ImportError:
-        logging.exception("Selenium is not installed; cannot run Leboncoin browser fallback")
-        return None
-
-    wait_seconds = int(os.getenv("LEBONCOIN_BROWSER_WAIT_SECONDS", "10"))
-
-    for attempt in range(1, BROWSER_LOAD_RETRIES + 1):
-        driver = None
-        try:
-            driver, binary_location, headless = _create_webdriver()
-            preload_delay = random.uniform(
-                MIN_BROWSER_PRELOAD_DELAY_SECONDS,
-                MAX_BROWSER_PRELOAD_DELAY_SECONDS,
-            )
-            logging.warning(
-                "Leboncoin browser load attempt=%s url=%s binary=%s headless=%s preload_delay=%.2fs",
-                attempt,
-                url,
-                binary_location,
-                headless,
-                preload_delay,
-            )
-            time.sleep(preload_delay)
-            driver.get(url)
-            time.sleep(wait_seconds)
-            html = driver.page_source
-            if not html:
-                logging.warning("Leboncoin browser returned empty HTML attempt=%s url=%s", attempt, url)
-                return None
-            logging.info("Leboncoin browser fallback loaded %s characters", len(html))
-            return html
-        except WebDriverException as exc:
-            error_text = str(exc)
-            if "ERR_CONNECTION_CLOSED" in error_text or "net::ERR_CONNECTION_CLOSED" in error_text:
-                logging.warning(
-                    "Leboncoin browser connection closed attempt=%s/%s url=%s: %s",
-                    attempt,
-                    BROWSER_LOAD_RETRIES,
-                    url,
-                    exc,
-                )
-                if attempt < BROWSER_LOAD_RETRIES:
-                    time.sleep(3 * attempt)
-                    continue
-            logging.warning("Leboncoin browser fallback failed attempt=%s url=%s: %s", attempt, url, exc)
-            return None
-        except Exception as exc:
-            logging.warning("Leboncoin browser fallback unexpected failure attempt=%s url=%s: %s", attempt, url, exc)
-            return None
-        finally:
-            if driver is not None:
-                try:
-                    driver.quit()
-                except Exception:
-                    logging.debug("Leboncoin browser quit failed for url=%s", url)
-
-    logging.warning("Leboncoin browser fallback exhausted retries for %s", url)
-    return None
-
-
-def _scrape_browser_fallback(keyword: str, page: int) -> List[Ad]:
-    url = _build_search_url(keyword, page)
-    html = _load_browser_page(url)
-    if not html:
-        logging.warning("Leboncoin browser fallback returned no HTML keyword=%s page=%s", keyword, page)
-        return []
-
-    ads = _parse_browser_results(html)
-    print(f"[LBC_BROWSER] {keyword} page {page} -> {len(ads)} ads")
-    logging.info("Leboncoin browser fallback keyword=%s page=%s ads=%s", keyword, page, len(ads))
-    return ads
-
-
-def scrape_leboncoin(session: Session) -> List[Ad]:
+    _set_status("running", 0, "scan started")
     results: List[Ad] = []
     seen_ids: set[str] = set()
-    skip_api = os.getenv("LEBONCOIN_SKIP_API", "1") == "1"
+    next_break_after = random.randint(3, 5)
 
-    for keyword in SEARCH_KEYWORDS:
-        for page in range(1, MAX_PAGES + 1):
-            parsed_ads: List[Optional[Ad]] = []
+    try:
+        from playwright.sync_api import sync_playwright
+        from playwright_stealth import Stealth
+    except ImportError as exc:
+        _set_status("error", 0, f"dependencies missing: {exc}")
+        logging.warning("Leboncoin Playwright dependencies missing: %s", exc)
+        return results
 
-            if not skip_api:
-                offset = (page - 1) * PAGE_SIZE
-                payload = _payload(keyword, offset)
-                logging.info("Leboncoin API request keyword=%s page=%s offset=%s", keyword, page, offset)
-                try:
-                    response = session.post(API_URL, json=payload, headers=_api_headers(), timeout=30)
-                    if _is_datadome_blocked(response):
-                        skip_api = True
-                        raise PermissionError("DataDome blocked Leboncoin API request")
-                    response.raise_for_status()
-                    data = response.json()
-                    ads_data = data.get("ads") or data.get("ad_list") or []
-                    print(f"[LBC] {keyword} page {page} -> {len(ads_data)} ads")
-                    parsed_ads = [_parse_api_ad(ad_data) for ad_data in ads_data]
-                except PermissionError as exc:
-                    logging.warning("Leboncoin API blocked keyword=%s page=%s: %s", keyword, page, exc)
-                except Exception as exc:
-                    logging.warning("Leboncoin API failed keyword=%s page=%s: %s", keyword, page, exc)
+    keywords = _selected_keywords()
+    if not keywords:
+        _set_status("empty", 0, "no keywords selected")
+        logging.warning("Leboncoin has no keywords selected")
+        return results
 
-            if skip_api or not parsed_ads:
-                logging.info("Leboncoin switching to browser mode keyword=%s page=%s", keyword, page)
-                parsed_ads = _scrape_browser_fallback(keyword, page)
+    logging.info("Leboncoin starting safe browser run with %s keywords", len(keywords))
+    stealth = Stealth(
+        navigator_languages_override=("fr-FR", "fr"),
+        navigator_platform_override="Win32",
+    )
 
-            page_added = 0
-            for ad in parsed_ads:
-                if ad is None:
-                    continue
-                if ad.ad_id in seen_ids:
-                    logging.debug("Leboncoin duplicate ad_id=%s", ad.ad_id)
-                    continue
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(
+            headless=False,
+            slow_mo=random.randint(150, 350),
+        )
 
-                seen_ids.add(ad.ad_id)
-                results.append(ad)
-                page_added += 1
+        context_kwargs = {
+            "user_agent": get_random_user_agent(),
+            "locale": "fr-FR",
+            "viewport": {"width": 1280, "height": 800},
+        }
+        if SESSION_PATH.exists():
+            context_kwargs["storage_state"] = str(SESSION_PATH)
 
-            logging.info(
-                "Leboncoin parsed keyword=%s page=%s added=%s cumulative=%s",
-                keyword,
-                page,
-                page_added,
-                len(results),
-            )
+        context = browser.new_context(**context_kwargs)
+        stealth.apply_stealth_sync(context)
+        page = context.new_page()
+        stealth.apply_stealth_sync(page)
 
-            _throttle_request()
+        try:
+            for keyword_index, keyword in enumerate(keywords, start=1):
+                next_break_after = _maybe_long_pause(keyword_index - 1, next_break_after)
 
-            if not parsed_ads:
-                logging.warning("Leboncoin returned 0 ads keyword=%s page=%s", keyword, page)
-                break
+                for page_number in range(1, MAX_PAGES + 1):
+                    search_url = _build_search_url(keyword, page_number)
+                    logging.info(
+                        "Leboncoin safe navigation keyword=%s page=%s url=%s",
+                        keyword,
+                        page_number,
+                        search_url,
+                    )
 
+                    try:
+                        content = _slow_open_search(page, search_url)
+                        context.storage_state(path=str(SESSION_PATH))
+                    except Exception as exc:
+                        print(f"Leboncoin error for keyword={keyword} page={page_number}: {exc}")
+                        _set_status("error", len(results), f"{keyword} page {page_number}: {exc}")
+                        logging.warning(
+                            "Leboncoin navigation failed keyword=%s page=%s: %s",
+                            keyword,
+                            page_number,
+                            exc,
+                        )
+                        pause = random.uniform(ERROR_BREAK_MIN_SECONDS, ERROR_BREAK_MAX_SECONDS)
+                        logging.info("Leboncoin error cooldown for %.2f seconds", pause)
+                        time.sleep(pause)
+                        break
+
+                    if _is_blocked(content):
+                        print("WARNING: BLOCK DETECTED")
+                        _set_status("blocked", len(results), f"captcha/datadome on {keyword} page {page_number}")
+                        logging.warning(
+                            "Leboncoin blocking detected, stopping scraping immediately keyword=%s page=%s",
+                            keyword,
+                            page_number,
+                        )
+                        return results
+
+                    if _is_soft_banned(content):
+                        print("WARNING: TEMPORARY RESTRICTED ACCESS DETECTED")
+                        cooldown = random.uniform(SOFT_BAN_BREAK_MIN_SECONDS, SOFT_BAN_BREAK_MAX_SECONDS)
+                        _set_status("soft_ban", len(results), f"temporary restricted access on {keyword} page {page_number}")
+                        logging.warning(
+                            "Leboncoin soft ban detected keyword=%s page=%s cooldown=%.2fs",
+                            keyword,
+                            page_number,
+                            cooldown,
+                        )
+                        time.sleep(cooldown)
+                        return results
+
+                    parsed_ads = _parse_browser_results(content)
+                    print(f"[LBC_PLAYWRIGHT] {keyword} page {page_number} -> {len(parsed_ads)} ads")
+                    logging.info(
+                        "Leboncoin parsed keyword=%s page=%s parsed=%s cumulative=%s",
+                        keyword,
+                        page_number,
+                        len(parsed_ads),
+                        len(results),
+                    )
+
+                    page_added = 0
+                    for ad in parsed_ads:
+                        if ad.ad_id in seen_ids:
+                            continue
+                        seen_ids.add(ad.ad_id)
+                        results.append(ad)
+                        page_added += 1
+
+                    logging.info(
+                        "Leboncoin accepted keyword=%s page=%s added=%s cumulative=%s",
+                        keyword,
+                        page_number,
+                        page_added,
+                        len(results),
+                    )
+
+                    _idle_pause("post_extract")
+                    keyword_pause = random.uniform(KEYWORD_BREAK_MIN_SECONDS, KEYWORD_BREAK_MAX_SECONDS)
+                    logging.info(
+                        "Leboncoin human cooldown keyword=%s page=%s for %.2f seconds",
+                        keyword,
+                        page_number,
+                        keyword_pause,
+                    )
+                    time.sleep(keyword_pause)
+
+                    if not parsed_ads:
+                        break
+        finally:
+            try:
+                context.storage_state(path=str(SESSION_PATH))
+            except Exception as exc:
+                logging.warning("Leboncoin could not persist session state: %s", exc)
+            context.close()
+            browser.close()
+
+    if results and LAST_STATUS["status"] == "running":
+        _set_status("ok", len(results), "ads collected")
+    elif not results and LAST_STATUS["status"] == "running":
+        _set_status("empty", 0, "no ads collected")
     return results
